@@ -220,88 +220,96 @@ fill_in_constant_lengths(pgssConstLocations *jstate, const char *query)
  *
  * Returns a palloc'd string.
  */
-static char *
-generate_normalized_query(pgssConstLocations *jstate, int query_loc, int* query_len_p, int encoding)
-{
-	char	   *norm_query;
-	const char *query = jstate->query;
-	int			query_len = *query_len_p;
-	int			i,
-				norm_query_buflen,		/* Space allowed for norm_query */
-				len_to_wrt,		/* Length (in bytes) to write */
-				quer_loc = 0,	/* Source query byte location */
-				n_quer_loc = 0, /* Normalized query byte location */
-				last_off = 0,	/* Offset from start for previous tok */
-				last_tok_len = 0;		/* Length (in bytes) of that tok */
-
-	/*
-	 * Get constants' lengths (core system only gives us locations).  Note
-	 * this also ensures the items are sorted by location.
-	 */
-	fill_in_constant_lengths(jstate, query);
-
-	/*
-	 * Allow for $n symbols to be longer than the constants they replace.
-	 * Constants must take at least one byte in text form, while a $n symbol
-	 * certainly isn't more than 11 bytes, even if n reaches INT_MAX.  We
-	 * could refine that limit based on the max value of n for the current
-	 * query, but it hardly seems worth any extra effort to do so.
-	 */
-	norm_query_buflen = query_len + jstate->clocations_count * 10;
-
-	/* Allocate result buffer */
-	norm_query = palloc(norm_query_buflen + 1);
-
-	for (i = 0; i < jstate->clocations_count; i++)
-	{
-		int			off,		/* Offset from start for cur tok */
-					tok_len,	/* Length (in bytes) of that tok */
-					param_id;	/* Param ID to be assigned */
-
-		off = jstate->clocations[i].location;
-		/* Adjust recorded location if we're dealing with partial string */
-		off -= query_loc;
-
-		tok_len = jstate->clocations[i].length;
-
-		if (tok_len < 0)
-			continue;			/* ignore any duplicates */
-
-		/* Copy next chunk (what precedes the next constant) */
-		len_to_wrt = off - last_off;
-		len_to_wrt -= last_tok_len;
-
-		Assert(len_to_wrt >= 0);
-		memcpy(norm_query + n_quer_loc, query + quer_loc, len_to_wrt);
-		n_quer_loc += len_to_wrt;
-
-		/* And insert a param symbol in place of the constant token */
-		param_id = (jstate->clocations[i].param_id < 0) ?
-					jstate->highest_extern_param_id + abs(jstate->clocations[i].param_id) :
-					jstate->clocations[i].param_id;
-		n_quer_loc += sprintf(norm_query + n_quer_loc, "$%d", param_id);
-
-		quer_loc = off + tok_len;
-		last_off = off;
-		last_tok_len = tok_len;
-	}
-
-	/*
-	 * We've copied up until the last ignorable constant.  Copy over the
-	 * remaining bytes of the original query string.
-	 */
-	len_to_wrt = query_len - quer_loc;
-
-	Assert(len_to_wrt >= 0);
-	memcpy(norm_query + n_quer_loc, query + quer_loc, len_to_wrt);
-	n_quer_loc += len_to_wrt;
-
-	Assert(n_quer_loc <= norm_query_buflen);
-	norm_query[n_quer_loc] = '\0';
-
-	*query_len_p = n_quer_loc;
-	return norm_query;
-}
+ static char *
+ generate_normalized_query(pgssConstLocations *jstate, int query_loc, int *query_len_p,
+													 int encoding, char ***norm_args, int *norm_args_count)
+ {
+		 char       *norm_query;
+		 const char *query = jstate->query;
+		 int         query_len = *query_len_p;
+		 int         i,
+								 norm_query_buflen,  /* Space allowed for norm_query */
+								 len_to_wrt,         /* Length (in bytes) to write */
+								 quer_loc = 0,       /* Source query byte location */
+								 n_quer_loc = 0,     /* Normalized query byte location */
+								 last_off = 0,       /* Offset from start for previous tok */
+								 last_tok_len = 0;   /* Length (in bytes) of that tok */
+ 
+		 /* Prepare storage for normalized constant arguments */
+		 char   **args_arr = NULL;
+		 int     args_count = 0;
+ 
+		 /* Get constants' lengths (this call also sorts them by location) */
+		 fill_in_constant_lengths(jstate, query);
+ 
+		 if (jstate->clocations_count > 0)
+				 args_arr = palloc(jstate->clocations_count * sizeof(char *));
+ 
+		 /*
+			* Allow for $n symbols to be longer than the constants they replace.
+			* We add extra space so that each constant (which takes at least one byte)
+			* can be replaced by a $n symbol (up to 11 bytes).
+			*/
+		 norm_query_buflen = query_len + jstate->clocations_count * 10;
+ 
+		 /* Allocate the result buffer for the normalized query */
+		 norm_query = palloc(norm_query_buflen + 1);
+ 
+		 for (i = 0; i < jstate->clocations_count; i++)
+		 {
+				 int off;        /* Offset (adjusted) for current constant token */
+				 int tok_len;    /* Length (in bytes) of the constant token */
+				 int param_id;   /* Param ID to be assigned */
+ 
+				 off = jstate->clocations[i].location;
+				 /* Adjust location if we're dealing with a partial string */
+				 off -= query_loc;
+ 
+				 tok_len = jstate->clocations[i].length;
+ 
+				 if (tok_len < 0)
+						 continue;  /* ignore any duplicates */
+ 
+				 /* Save the constant argument value */
+				 args_arr[args_count] = palloc(tok_len + 1);
+				 memcpy(args_arr[args_count], query + off, tok_len);
+				 args_arr[args_count][tok_len] = '\0';
+				 args_count++;
+ 
+				 /* Copy next chunk (text preceding the current constant) */
+				 len_to_wrt = off - last_off;
+				 len_to_wrt -= last_tok_len;
+				 Assert(len_to_wrt >= 0);
+				 memcpy(norm_query + n_quer_loc, query + quer_loc, len_to_wrt);
+				 n_quer_loc += len_to_wrt;
+ 
+				 /* Insert the parameter marker in place of the constant */
+				 param_id = (jstate->clocations[i].param_id < 0) ?
+										 jstate->highest_extern_param_id + abs(jstate->clocations[i].param_id) :
+										 jstate->clocations[i].param_id;
+				 n_quer_loc += sprintf(norm_query + n_quer_loc, "$%d", param_id);
+ 
+				 quer_loc = off + tok_len;
+				 last_off = off;
+				 last_tok_len = tok_len;
+		 }
+ 
+		 /* Copy the remaining portion of the original query */
+		 len_to_wrt = query_len - quer_loc;
+		 Assert(len_to_wrt >= 0);
+		 memcpy(norm_query + n_quer_loc, query + quer_loc, len_to_wrt);
+		 n_quer_loc += len_to_wrt;
+ 
+		 Assert(n_quer_loc <= norm_query_buflen);
+		 norm_query[n_quer_loc] = '\0';
+ 
+		 *query_len_p = n_quer_loc;
+		 *norm_args = args_arr;
+		 *norm_args_count = args_count;
+ 
+		 return norm_query;
+ }
+ 
 
 static void RecordConstLocation(pgssConstLocations *jstate, int location)
 {
@@ -623,7 +631,11 @@ PgQueryNormalizeResult pg_query_normalize_ext(const char* input, bool normalize_
 		const_record_walker((Node *) tree, &jstate);
 
 		/* Normalize query */
-		result.normalized_query = strdup(generate_normalized_query(&jstate, 0, &query_len, PG_UTF8));
+		char **norm_args = NULL;
+		int norm_args_count = 0;
+		result.normalized_query = strdup(generate_normalized_query(&jstate, 0, &query_len, PG_UTF8, &norm_args, &norm_args_count));
+		result.norm_args = norm_args;
+		result.norm_args_count = norm_args_count;
 	}
 	PG_CATCH();
 	{

@@ -67,6 +67,8 @@ typedef struct {
 
 typedef struct {
   char* normalized_query;
+  char** norm_args;
+  int norm_args_count;
   PgQueryError* error;
 } PgQueryNormalizeResult;
 
